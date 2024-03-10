@@ -92,8 +92,10 @@ def get_data():
     test_ds = pd.read_csv("test.csv")
     test_ds = test_ds.dropna(axis=0, how="any")
 
+
     X_train = train_ds[["id", "text"]]
     Y_train = pd.get_dummies(train_ds["emotions"], dtype='int')
+    # print("ratios: " + str(train_ds["emotions"].value_counts()))
 
     X_test = test_ds[["id", "text"]]
 
@@ -127,9 +129,10 @@ def cross_entropy(actual, pred):
     return np.squeeze(-np.sum(np.multiply(np.log(pred), actual)) / actual.shape[0])
 
 def accuracy(actual, pred):
-    return np.sum(np.equal(actual, pred)) / len(actual)
+    acc = np.sum(np.equal(np.argmax(actual, axis=1), np.argmax(pred, axis=1))) / len(actual)
+    return acc
 
-def forward(input_data, weights_list, biases_list):
+def forward(input_data, weights_list, biases_list, dropout=0.0):
     # Takes input data, weights, and biases.
     # EXPECTED INPUT DATA SHAPE: num_features * batch_size
     # EXPECTED OUTPUT DATA SHAPE: num_outputs * batch_size
@@ -138,8 +141,15 @@ def forward(input_data, weights_list, biases_list):
     # We store outputs in here. Next layers will use these outputs as well in propogating forward
     outputs = []
 
+    # Dropout algorithm
+    # Used inverted dropout, described: https://www.youtube.com/watch?v=D8PJAL-MZv8&list=PLkDaE6sCZn6Hn0vK8co82zjQtt3T2Nkqc&index=8
+
+
     last_idx = len(weights_list) - 1
+
+    dropout_matrices = []
     for layer_idx in range(last_idx+1):
+        dropout_matrix = None
         weights = weights_list[layer_idx]
         biases = biases_list[layer_idx]
 
@@ -151,13 +161,26 @@ def forward(input_data, weights_list, biases_list):
 
         if layer_idx != last_idx:
             # If normal layer just relu like normal
-            outputs.append(relu(dot_prod))
+            activated = relu(dot_prod)
         else:
             # Otherwise we apply sigmoid or softmax
-            outputs.append(softmax(dot_prod))
-    return outputs
+            activated = softmax(dot_prod)
 
-def backwards(input_data, output_data, predictions, weights_list, biases_list, learning_rate):
+        # Only apply dropout on non-output and non-input layers
+        keep_prob = 1 - dropout
+        if dropout > 0 and layer_idx != last_idx and layer_idx != 0:
+            # Dropout matrix, we'll apply onto activation
+            dropout_matrix = np.random.rand(activated.shape[0], activated.shape[1]) < (1-dropout)
+            activated = np.multiply(activated, dropout_matrix) # Zeros out some activations
+            # Because neurons are dropped, the actual value produced drops by ~% neurons dropped, so correction is needed.
+            activated /= (dropout-1)
+
+        dropout_matrices.append(dropout_matrix)
+        outputs.append(activated)
+    return outputs, dropout_matrices
+
+
+def backwards(input_data, output_data, predictions, weights_list, biases_list, learning_rate, dropout=0.0, dropout_matrices=None):
     last_idx = len(weights_list) - 1
     # Goes backwards and updates the gradients
 
@@ -190,6 +213,15 @@ def backwards(input_data, output_data, predictions, weights_list, biases_list, l
         #   dInput / dW_:?. This is just the relevant weight.
         # Multiply it all together:
         # print(predictions[layer_idx-1])
+
+        # Avoid updating the weights that were dropped, defined by the dropout matrix:
+        if dropout > 0:
+            dropout_matrix = dropout_matrices[layer_idx]
+            assert dropout_matrix is not None
+            # Once again need to cancel out the dropout...
+            prior_gradient = np.multiply(prior_gradient, dropout_matrix)
+            prior_gradient /= (1-dropout)
+
         tmp_derivative = d_relu(predictions[layer_idx])  # Derivative relu using relu and predictions
         tmp_derivative2 = np.multiply(prior_gradient, tmp_derivative)
 
@@ -237,77 +269,155 @@ def LR():
     return None
 
 def NN():
-    _X_train, _X_test, _Y_train, Y_test = get_data()
+    np.random.seed(96)
+    # X_train, X_test, Y_train, Y_test = get_iris_data()
+
+    _X_train, _X_final_test, _Y_train, _Y_test = get_data()
 
     # Apply tf-idf! (during cross validation this will applied to the train set)
-    tf_idf_class = TFIDF_PROCESSOR()
-    tf_idf_class.configure(_X_train["text"], threshold=2)
 
-    results = []
-    for sentence in _X_train["text"]:
-        result = tf_idf_class.apply(sentence)
-        results.append(result)
+    X_train_total = np.asarray(_X_train["text"])
+    Y_train_total = np.asarray(_Y_train)
+    emotion_list = sorted(["joy", "sadness", "anger", "fear", "love", "surprise"])
 
-    X_train = np.asarray(results)
-    Y_train = np.asarray(_Y_train)
+    emotions = [0, 0, 0, 0, 0, 0]
+    for emote in Y_train_total:
+        emotions[np.argmax(emote)] += 1
+    counts = pd.Series(emotions, index=emotion_list)
+    print("Overall Ratio counts: \n" + str(counts))
 
-    # Define the relu and softmax functions
-    # Builds a neural network
 
-    # Weights and biases, indexed by layer position (0 is input layer to output layer)
-    # Each weight is a OUTPUT x INPUT sized matrix. So for a 3x10 matrix:
-    #       10 columns for the 10 input weights
-    #       3 rows for each of the 3 output neurons.
-    LayerWeights = []
-    LayerBiases = []
+    # Shuffle the rows! During cross validation we'll just select one fifth at a time
+    shuffled_indices = np.arange(X_train_total.shape[0])
+    np.random.shuffle(shuffled_indices) # NOTICE: DOES IT IN PLACE!
+    X_train_shuffled = X_train_total[shuffled_indices]
+    Y_train_shuffled = Y_train_total[shuffled_indices]
 
-    NUM_ITERS = 1000
-    LR = 0.03
+    # Compute index tuples for 5-fold cross-validation
+    selection_indices = np.arange(X_train_total.shape[0])
+    train_indices = []
+    test_indices = []
+    k = 5
+    fold_size = int(len(selection_indices) / k)
 
-    input_size = X_train.shape[1]
-    layer_one = 100
-    layer_two = 100
-    output_layer = Y_train.shape[1]
+    test_accuracies = []
+    for fold in range(k):
+        testo = selection_indices[fold*fold_size: (fold+1)*fold_size] # Everything between the fold and fold size
+        # Everything before and everything after
+        traino = np.concatenate([selection_indices[:fold*fold_size], selection_indices[(fold+1)*fold_size:]])
+        train_indices.append(traino)
+        test_indices.append(testo)
 
-    print("Neural network architecture: Input size " + str(input_size))
-    print("Neural network architecture: Output size " + str(Y_train.shape[1]))
+    for i in range(k):
+        print("FOLD: " + str(i))
+        X_train_sel = X_train_shuffled[train_indices[i]]
+        Y_train_sel = Y_train_shuffled[train_indices[i]]
+        X_test_sel = X_train_shuffled[test_indices[i]]
+        Y_test_sel = Y_train_shuffled[test_indices[i]]
 
-    NetworkArchitecture = [input_size, layer_one, layer_two, output_layer]
+        emotions = [0, 0, 0, 0, 0, 0]
+        for emote in Y_train_sel:
+            emotions[np.argmax(emote)] += 1
+        train_counts = pd.Series(emotions, index=emotion_list)
+        emotions = [0, 0, 0, 0, 0, 0]
+        for emote in Y_test_sel:
+            emotions[np.argmax(emote)] += 1
+        test_counts = pd.Series(emotions, index=emotion_list)
+        print("Train Ratio counts: \n" + str(train_counts))
+        print("Test Ratio counts: \n" + str(test_counts))
 
-    # Initialize weights here using gaussian
 
-    np.random.seed(0)
-    for layer_idx in range(len(NetworkArchitecture)-1):
-        input_size = NetworkArchitecture[layer_idx]
-        output_size = NetworkArchitecture[layer_idx+1]
+        print("Train size : " + str(X_train_sel.shape[0]))
+        print("Test size : " + str(X_test_sel.shape[0]))
 
-        LayerWeights.append(np.random.normal(0, np.sqrt(2.0 / input_size), (output_size, input_size)))
-        LayerBiases.append(np.random.normal(0, np.sqrt(2.0 / input_size), (output_size, 1)))
+        # Generate tf-idf converter
+        tf_idf_class = TFIDF_PROCESSOR()
+        tf_idf_class.configure(pd.Series(X_train_sel), threshold=1)
 
-    # Execute the forward passes!
-    for iter in range(NUM_ITERS):
-        # Compute the forward outputs
+        # Convert both test and train data into vectors
 
-        # Need to transpose into feature * batch size for matmul
-        curr_pred = forward(X_train.T, LayerWeights, LayerBiases)
+        X_train_list = []
+        for sentence in X_train_sel:
+            result = tf_idf_class.apply(sentence)
+            X_train_list.append(result)
 
-        # Need to determine the error for the last prediction! AKA MSE
-        last_pred = curr_pred[-1] # Get the last prediction! Should be num_output * batch size
-        # Our loss function is MSE. To make the derivative easier, we use 1/2 * (
-        # curr_loss = mse(Y_train, last_pred)
-        curr_loss = cross_entropy(Y_train, last_pred.T)
-        curr_acc = accuracy(Y_train, last_pred.T)
-        print("ITERATION: " + str(iter) + ", LOSS: " + str(curr_loss) + ", ACC: " + str(curr_acc))
+        X_test_list = []
+        for sentence in X_test_sel:
+            result = tf_idf_class.apply(sentence)
+            X_test_list.append(result)
 
-        # Our loss function for multiclass classification is cross-entropy loss.
-        LayerWeights, LayerBiases = backwards(X_train.T, Y_train.T, curr_pred, LayerWeights, LayerBiases, LR)
+        X_train = np.asarray(X_train_list)
+        Y_train = Y_train_sel
 
-    # Make predictions
-    print("Final prediction!")
-    last_pred = forward(X_train.T, LayerWeights, LayerBiases)[-1]
-    curr_loss = cross_entropy(Y_train, last_pred.T)
-    curr_acc = accuracy(Y_train, last_pred.T)
-    print("FINAL ACC: " + str(curr_acc))
+        X_test = np.asarray(X_test_list)
+        Y_test = Y_test_sel
+
+
+        # Define the relu and softmax functions
+        # Builds a neural network
+
+        # Weights and biases, indexed by layer position (0 is input layer to output layer)
+        # Each weight is a OUTPUT x INPUT sized matrix. So for a 3x10 matrix:
+        #       10 columns for the 10 input weights
+        #       3 rows for each of the 3 output neurons.
+        LayerWeights = []
+        LayerBiases = []
+
+        NUM_ITERS = 15000
+        LR = 0.05
+        DROPOUT = 0.5
+
+        input_size = X_train.shape[1]
+        layer_one = 24
+        layer_two = 12
+        output_layer = Y_train.shape[1]
+
+        print("Neural network architecture: Input size " + str(input_size))
+        print("Neural network architecture: Output size " + str(Y_train.shape[1]))
+
+        NetworkArchitecture = [input_size, layer_one, layer_two, output_layer]
+
+        # Initialize weights here using gaussian
+
+        np.random.seed(0)
+        for layer_idx in range(len(NetworkArchitecture)-1):
+            input_size = NetworkArchitecture[layer_idx]
+            output_size = NetworkArchitecture[layer_idx+1]
+
+            LayerWeights.append(np.random.normal(0, np.sqrt(2.0 / input_size), (output_size, input_size)))
+            LayerBiases.append(np.random.normal(0, np.sqrt(2.0 / input_size), (output_size, 1)))
+
+        # Execute the forward passes!
+        for iter in range(NUM_ITERS):
+            # Compute the forward outputs
+
+            # Need to transpose into feature * batch size for matmul
+            train_predictions, dropout_matrices = forward(X_train.T, LayerWeights, LayerBiases, dropout=DROPOUT)
+            test_predictions, _ = forward(X_test.T, LayerWeights, LayerBiases)
+
+            # Need to determine the error for the last prediction! AKA MSE
+            train_pred = train_predictions[-1] # Get the last prediction! Should be num_output * batch size
+            test_pred = test_predictions[-1]
+            # Our loss function is MSE. To make the derivative easier, we use 1/2 * (
+            # curr_loss = mse(Y_train, last_pred)
+            curr_loss = cross_entropy(Y_train, train_pred.T)
+            train_acc = accuracy(Y_train, train_pred.T)
+            test_acc = accuracy(Y_test, test_pred.T)
+            if iter % 1000 == 0:
+                print("ITERATION: " + str(iter) + ", LOSS: " + str(curr_loss) + ", TRAIN_ACC: " + str(train_acc) + ", TEST_ACC: " + str(test_acc))
+
+            # Our loss function for multiclass classification is cross-entropy loss.
+            LayerWeights, LayerBiases = backwards(X_train.T, Y_train.T, train_predictions, LayerWeights, LayerBiases, LR, dropout=DROPOUT, dropout_matrices=dropout_matrices)
+
+        # Make predictions
+        print("Final prediction!")
+        last_pred = forward(X_test.T, LayerWeights, LayerBiases)[0][-1]
+        curr_acc = accuracy(Y_test, last_pred.T)
+        print("FINAL TEST ACC: " + str(curr_acc))
+        test_accuracies.append(curr_acc)
+        print()
+
+    print("Cross-validation completed. Final test accuracies: " + str(test_accuracies))
 
 
 if __name__ == '__main__':
